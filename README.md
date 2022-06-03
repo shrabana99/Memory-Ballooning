@@ -33,6 +33,10 @@ Compile buildroot: make -j4
 ```
 
 > :warning: c files to be compiled statically using --static flag
+> 
+> :heavy_check_mark: first complie c files, then make buildroot
+> 
+> :heavy_plus_sign: make -j<no_of_threads> for multithreading 
 
 ### Using patchfiles
 ```
