@@ -1,0 +1,1069 @@
+From ba4ef1dceb891df01243866f48f3744fbf9253b1 Mon Sep 17 00:00:00 2001
+From: Shrabana Biswas <shrabanab@iisc.ac.in>
+Date: Fri, 15 Apr 2022 19:55:03 +0530
+Subject: [PATCH] os assignment-2
+
+Signed-off-by: Shrabana Biswas <shrabanab@iisc.ac.in>
+---
+ Makefile                               |   2 +-
+ arch/x86/entry/syscalls/syscall_64.tbl |   2 +
+ ballooning/Makefile                    |   1 +
+ ballooning/ballooning.c                | 324 +++++++++++++++++++++++++
+ include/linux/syscalls.h               |   3 +
+ kernel/exit.c                          |  43 ++++
+ mm/memory.c                            | 177 +++++++++++++-
+ mm/mmap.c                              |  15 +-
+ mm/page_alloc.c                        |  75 +++++-
+ mm/rmap.c                              |   6 +
+ mm/vmscan.c                            |  44 +++-
+ 11 files changed, 680 insertions(+), 12 deletions(-)
+ create mode 100644 ballooning/Makefile
+ create mode 100644 ballooning/ballooning.c
+
+diff --git a/Makefile b/Makefile
+index 1673c12fb..308fdded5 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1097,7 +1097,7 @@ export MODORDER := $(extmod-prefix)modules.order
+ export MODULES_NSDEPS := $(extmod-prefix)modules.nsdeps
+ 
+ ifeq ($(KBUILD_EXTMOD),)
+-core-y		+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/ block/
++core-y		+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/ block/ ballooning/
+ 
+ vmlinux-dirs	:= $(patsubst %/,%,$(filter %/, \
+ 		     $(core-y) $(core-m) $(drivers-y) $(drivers-m) \
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index 78672124d..2a52cc47b 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -406,5 +406,7 @@
+ 545	x32	execveat		compat_sys_execveat
+ 546	x32	preadv2			compat_sys_preadv64v2
+ 547	x32	pwritev2		compat_sys_pwritev64v2
++548	64	ballooning		sys_ballooning
++549 64  swapfile        sys_swaplist
+ # This is the end of the legacy x32 range.  Numbers 548 and above are
+ # not special and are not to be used for x32-specific syscalls.
+diff --git a/ballooning/Makefile b/ballooning/Makefile
+new file mode 100644
+index 000000000..c09834408
+--- /dev/null
++++ b/ballooning/Makefile
+@@ -0,0 +1 @@
++obj-y := ballooning.o
+diff --git a/ballooning/ballooning.c b/ballooning/ballooning.c
+new file mode 100644
+index 000000000..91087cb1d
+--- /dev/null
++++ b/ballooning/ballooning.c
+@@ -0,0 +1,324 @@
++#include<linux/fs.h>
++#include<linux/mm_types.h> // types
++#include <linux/sched.h> //  for task_struct
++#include <linux/kernel.h>
++#include<linux/syscalls.h> //syscall 
++#include <linux/file.h> //  file handler 
++#include<linux/mm.h> // put page 
++#include <linux/namei.h> // directory 
++#include <linux/mman.h> // do_madvise
++#include<linux/swap.h>
++#include<linux/rmap.h> // try_to_unmap
++
++// what for what
++#include<linux/sched/signal.h>
++// #include<linux/signal_types.h>
++
++// #include <linux/sched/mm.h>
++// #include <asm/pgtable.h>
++
++
++
++#define DEBUG 0
++#if defined(DEBUG) && DEBUG > 0
++    #define PRINTK(fmt, args...) printk("_________KERNELSIDE_________ %s:%d:%s(): " fmt, \
++  __FILE__, __LINE__, __func__, ##args)
++#else
++    #define PRINTK(fmt, args...) 
++#endif
++
++typedef unsigned long long ull;
++
++#define SOME_MEMORY_LIMIT (1UL * 1024 * 1024)
++
++
++// numbering signal
++#define SIGBALLOON 			50
++// size of swapfile
++#define SWAP_FILE_SIZE 		512 * 1024 * 1024
++// page size in swapfile
++#define PAGE_SIZE 4096
++// maximum pages present within swapfile 
++#define totalPageCount  128 * 1024
++// Mode to open file
++#define MODE 0666
++// used pages within swapfile 
++ull totalPageUsed = 0;
++// array to keep tracking from which offset the swapfile is empty 
++ull swapPageMap[totalPageCount];
++
++
++
++// total number of application entering ballooning sub system
++int participantNo = 0, firstTimeAllocate = 0, debug = DEBUG;
++int sendSignalOnce; 
++
++// application info entering ballooning sub system
++struct task_struct *participantTask;
++
++// for disabling swap 
++extern int vm_swappiness; 
++char fullPath[50] = "/ballooning/swapfile_#\0"; 
++
++
++
++void setBallooningState(void); 
++void createSwapFile(void); 
++int addTOSwapFile(ull addr); 
++int callZPR(ull addr); 
++int checker(void); 
++
++extern unsigned long shrink_all_memory(unsigned long nr_to_reclaim);
++
++SYSCALL_DEFINE0(ballooning){
++	if(debug) {
++		PRINTK("debug mode on\n"); 
++	}
++		
++	if(participantNo){
++		PRINTK("Already one process has registered\n");
++		return -1; 
++	}
++
++	setBallooningState(); 
++	// printk("current application PID: %d\n",participantTask->pid);
++	
++	// PRINTK("creating swapfile\n");
++	createSwapFile(); 
++	// PRINTK("------swapfile created-------\n");
++	return 0;
++}
++
++
++
++
++SYSCALL_DEFINE2(swaplist, unsigned long long * __user, listOfPagesToSwap, int, sizeofList){
++
++
++	printk("trying to free %d pages", sizeofList); 
++	if(sizeofList == 0){
++		return 0; 
++	}
++	
++	int res; 
++	ull *buffer;
++	
++	buffer =   kmalloc (sizeof(ull) * sizeofList , GFP_KERNEL); 
++
++	res = copy_from_user(buffer, listOfPagesToSwap, sizeof(ull) * sizeofList ); 
++	if(res) { //  Returns number of bytes that could not be copied. On success, this will be zero. 
++		return -1; 
++	}
++	
++	ull addr, i;
++	for(i = 0; i < sizeofList; i++){
++		addr = *(buffer + i); 
++		// printk("%lx", addr);
++		res = addTOSwapFile(addr);
++		if(res != 0) 
++			return res; 
++
++		res = callZPR(addr);
++		if(res != 0) 
++			return res; 
++
++	}
++	
++	kfree(buffer);
++
++	return checker(); 
++}
++
++
++void setBallooningState(void){
++
++	participantNo += 1;
++	participantTask = current;	
++	vm_swappiness = 0;
++	sendSignalOnce = 0;
++	memset(swapPageMap, 0, sizeof(swapPageMap));
++
++	char pidS[4] ; // = "###\0";
++	pidS[0] = (char)   ( 48 + participantTask->pid / 100); 
++	pidS[1] = (char)  (48 + (participantTask->pid / 10)% 10); 
++	pidS[2] = (char)  (48 + participantTask->pid %10); 
++	pidS[3] = '\0'; 
++
++	strcat( fullPath, pidS); 
++	
++}
++
++void createSwapFile(void){
++	struct dentry *dentry;
++	struct path path , pathE ;
++
++	int flag = kern_path("/ballooning", LOOKUP_FOLLOW, &pathE);
++
++	if(flag){
++		dentry = kern_path_create(AT_FDCWD, "/ballooning", &path, LOOKUP_DIRECTORY);
++		vfs_mkdir( path.dentry->d_inode, dentry, 0);
++		done_path_create(&path, dentry);
++	} 
++
++	struct file *swapFile = NULL;
++
++	swapFile = filp_open(fullPath, O_CREAT|O_RDWR, MODE ); 	
++
++	vfs_fallocate(swapFile, 0, 0, SWAP_FILE_SIZE); 
++	filp_close(swapFile, current->files);
++}
++
++int addTOSwapFile(ull addr){
++	// printk(addr); 
++	// write into the swapfile
++	PRINTK("openning Swapfile \n");
++	struct file *swapFile = NULL;
++	swapFile = filp_open(fullPath, O_CREAT|O_RDWR, MODE ); 	
++	
++	PRINTK("Opened Swapfile \n");
++	if(totalPageUsed == totalPageCount ){
++		PRINTK(" No space available in swapfile!\n");
++		return -2;
++	}
++
++	// finding empty offset where we can write this data
++	int i;
++	for(i = 0; i < totalPageCount; i++){
++		if(swapPageMap[i] == 0){
++			swapPageMap[i] = addr; 
++			totalPageUsed++;
++			break;
++		}
++	}
++
++	char* data = (char*) addr;
++
++	PRINTK("writing data\n");
++	loff_t offset = PAGE_SIZE * i; 
++	int res = kernel_write(swapFile, data, PAGE_SIZE, &offset);
++	PRINTK("kernel write retured: %d, offset: %d\n", res, i);
++	filp_close(swapFile, current->files);
++	return 0; 
++}
++
++
++int callZPR(ull addr){
++	struct vm_area_struct *vma = find_vma(current->mm, addr);
++	if(vma == NULL || addr >= vma->vm_end){ // invalid address
++		PRINTK(" invalid address\n " );
++		return -3;
++	}
++	zap_page_range(vma, addr, PAGE_SIZE); 
++	return 0;
++}
++
++int checker(void){
++
++	shrink_all_memory(100000); // (3LL << 15)
++
++	ull freeMemory = nr_free_pages() << (2);
++	// printk("free memory : %llu", freeMemory);
++
++	// allowing multiple signals ?? 
++	sendSignalOnce = 0; 
++
++	if(freeMemory >  SOME_MEMORY_LIMIT) {
++		return 0;
++	}
++	return totalPageUsed; 
++
++}
++
++
++
++/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++/* 
++ *  end[less] experiments 
++ */
++
++
++
++	// try_to_unmap(page, TTU_BATCH_FLUSH); 
++	
++
++
++	// page table update
++
++	// free the physical page to the buddy all
++
++	// mapping the page pte
++	// PRINTK("%lu", pte->pte);
++	// *pte= pte_clear_flags(*pte, _PAGE_PRESENT);
++	// swapPageMap[i] = pte; 
++
++	// PRINTK("%lu", pte->pte);
++	// flush_tlb_all();
++
++	// printk("present bit: %d ", pte_present(*pte)); 
++	// printk("none bit: %d ", pte_none(*pte));
++	// // printk("present bit: %d ", pte_dirty(pte)); 
++	// // printk("present bit: %d ", pte_(pte)); 
++
++
++
++	
++	
++
++	// //free_unref_page(page);
++	// free_swap_cache(page);
++	// put_page(page);
++	// *pte= pte_clear_flags(*pte, _PAGE_PRESENT);
++	// *pte= pte_set_flags(*pte, _PAGE_PROTNONE);
++
++	// printk("present bit: %d ", pte_present(*pte)); 
++	// printk("none bit: %d ", pte_none(*pte));
++	// printk("dirty bit: %d ", PageDirty(page));
++	// printk("inactive bit: %d ",  PageActive(page));
++
++
++	// PRINTK("printing pte: %lx and ptent : %lx", pte, *pte); 
++	// zap_page_range(vma, addr, PAGE_SIZE); 
++	// put_page(page);
++	// try_to_unmap(page, TTU_BATCH_FLUSH); 
++
++	
++	// //flush_tlb_all();
++	
++	// // struct page ** pagep = &page;
++	// // release_pages(pagep,1);
++
++	// PRINTK(" brefore freeing: %lu" , nr_free_pages() );
++	
++	// deactivate_page(page);
++	// int ret_val_madvise = do_madvise(current->mm, addr, PAGE_SIZE, MADV_PAGEOUT); // MADV_FREE
++
++	
++	// // PRINTK("returned val: %d", ret_val_madvise);
++
++
++	// int ret_free_pages = shrink_all_memory();
++    // PRINTK("%d\n", ret_free_pages);
++
++	// printk("present bit: %d ", pte_present(*pte)); 
++	// printk("none bit: %d ", pte_none(*pte));
++	// printk("_PAGE_PROTNONE bit: %d ", pte_protnone(*pte));
++
++	// printk("%d"); 
++
++	// PRINTK("printing the pte: %lx", *pte);
++
++
++	// int ret = munmapHelper(addr, PAGE_SIZE); 
++	// // PRINTK("%d", ret);
++	// vunmap(addr); 
++
++	// vm_munmap(addr, PAGE_SIZE); 
++
++
++// // #include <time.h>
++// #include <linux/time.h>
++
++
++	// struct timespec startTime, endTime;
++	// getnstimeofday(&startTime, NULL);
++    // // gettimeofday(&startTime, NULL);
+\ No newline at end of file
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 7688bc983..4b2d344da 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1364,4 +1364,7 @@ int __sys_getsockopt(int fd, int level, int optname, char __user *optval,
+ 		int __user *optlen);
+ int __sys_setsockopt(int fd, int level, int optname, char __user *optval,
+ 		int optlen);
++		
++asmlinkage long sys_ballooning(void);
++asmlinkage long sys_swaplist( unsigned long long *, int); 
+ #endif
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 04029e35e..9a702801a 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -724,9 +724,49 @@ static void check_stack_usage(void)
+ static inline void check_stack_usage(void) {}
+ #endif
+ 
++
++// shrabana 
++extern int participantNo; 
++extern struct task_struct *participantTask;
++extern int vm_swappiness; 
++#define totalPageCount  128 * 1024
++
++extern unsigned long long swapPageMap[totalPageCount];
++
++
++
++extern char fullPath[50]; // = "/ballooning/swapfile_#\0"; 
++#define MODE 0666
++
++void resetBallooningState(void){
++
++	if(participantNo && current->pid  == participantTask->pid ) {
++		// reset the ballooning subsystem variables
++		participantNo = 0;
++		participantTask =  NULL;	
++		memset(swapPageMap, 0, sizeof(swapPageMap));
++
++		
++		// reset vm_swappiness
++		vm_swappiness = 60;
++
++		struct file *swapFile = NULL;
++		swapFile = filp_open(fullPath, O_CREAT|O_RDWR, MODE );
++		struct inode *parent_inode = swapFile->f_path.dentry->d_parent->d_inode;
++		vfs_unlink(parent_inode, swapFile->f_path.dentry, NULL);
++
++
++		printk("Im leaving\n");
++	}	
++}
++/////////////////////////////////////////////////
++
++
+ void __noreturn do_exit(long code)
+ {
+ 	struct task_struct *tsk = current;
++	
++	
+ 	int group_dead;
+ 
+ 	/*
+@@ -811,6 +851,9 @@ void __noreturn do_exit(long code)
+ 
+ 	exit_mm();
+ 
++	resetBallooningState(); // shrabana  
++
++
+ 	if (group_dead)
+ 		acct_process();
+ 	trace_sched_process_exit(tsk);
+diff --git a/mm/memory.c b/mm/memory.c
+index c05d4c4c0..34ade84b4 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1203,6 +1203,21 @@ copy_page_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma)
+ 	return ret;
+ }
+ 
++//shrabana
++// array to keep tracking from which offset the swapfile is empty 
++#define totalPageCount  128 * 1024
++
++extern unsigned long swapPageMap[totalPageCount];
++extern int participantNo, debug;
++extern char fullPath[50]; 
++extern unsigned long ghapla;
++extern struct task_struct *participantTask;
++extern unsigned long totalPageUsed;
++unsigned long long addrForSwapIn; 
++////////////////////////////////////////////////////////////
++
++
++
+ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 				struct vm_area_struct *vma, pmd_t *pmd,
+ 				unsigned long addr, unsigned long end,
+@@ -1224,6 +1239,7 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 	flush_tlb_batched_pending(mm);
+ 	arch_enter_lazy_mmu_mode();
+ 	do {
++
+ 		pte_t ptent = *pte;
+ 		if (pte_none(ptent))
+ 			continue;
+@@ -1260,10 +1276,13 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 				    likely(!(vma->vm_flags & VM_SEQ_READ)))
+ 					mark_page_accessed(page);
+ 			}
++
+ 			rss[mm_counter(page)]--;
+ 			page_remove_rmap(page, false);
+-			if (unlikely(page_mapcount(page) < 0))
++			if (unlikely(page_mapcount(page) < 0)){
++				// printk("line 1289\n"); 
+ 				print_bad_pte(vma, addr, ptent, page);
++			}
+ 			if (unlikely(__tlb_remove_page(tlb, page))) {
+ 				force_flush = 1;
+ 				addr += PAGE_SIZE;
+@@ -1306,8 +1325,12 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 			page = migration_entry_to_page(entry);
+ 			rss[mm_counter(page)]--;
+ 		}
++		
+ 		if (unlikely(!free_swap_and_cache(entry)))
+-			print_bad_pte(vma, addr, ptent, NULL);
++			{
++				print_bad_pte(vma, addr, ptent, NULL);
++								
++			}
+ 		pte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
+ 	} while (pte++, addr += PAGE_SIZE, addr != end);
+ 
+@@ -3508,6 +3531,8 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 		return 0;
+ 
+ 	/* Use the zero-page for reads */
++
++
+ 	if (!(vmf->flags & FAULT_FLAG_WRITE) &&
+ 			!mm_forbids_zeropage(vma->vm_mm)) {
+ 		entry = pte_mkspecial(pfn_pte(my_zero_pfn(vmf->address),
+@@ -3518,16 +3543,20 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 			update_mmu_tlb(vma, vmf->address, vmf->pte);
+ 			goto unlock;
+ 		}
++	
++
+ 		ret = check_stable_address_space(vma->vm_mm);
+ 		if (ret)
+ 			goto unlock;
+ 		/* Deliver the page fault to userland, check inside PT lock */
++
+ 		if (userfaultfd_missing(vma)) {
+ 			pte_unmap_unlock(vmf->pte, vmf->ptl);
+ 			return handle_userfault(vmf, VM_UFFD_MISSING);
+ 		}
++
+ 		goto setpte;
+-	}
++	} 
+ 
+ 	/* Allocate our own private page. */
+ 	if (unlikely(anon_vma_prepare(vma)))
+@@ -3540,6 +3569,7 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ 		goto oom_free_page;
+ 	cgroup_throttle_swaprate(page, GFP_KERNEL);
+ 
++
+ 	/*
+ 	 * The memory barrier inside __SetPageUptodate makes sure that
+ 	 * preceding stores to the page contents become visible before
+@@ -3576,10 +3606,19 @@ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ setpte:
+ 	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+ 
++
+ 	/* No need to invalidate - it was non-present before */
+ 	update_mmu_cache(vma, vmf->address, vmf->pte);
+ unlock:
+ 	pte_unmap_unlock(vmf->pte, vmf->ptl);
++
++	// shrabana
++
++
++
++
++
++
+ 	return ret;
+ release:
+ 	put_page(page);
+@@ -4381,8 +4420,59 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ 	}
+ 
+ 	if (!vmf->pte) {
+-		if (vma_is_anonymous(vmf->vma))
+-			return do_anonymous_page(vmf);
++		if (vma_is_anonymous(vmf->vma)){
++			
++		
++			vm_fault_t xyz = 			 do_anonymous_page(vmf);
++
++			// // shrabana
++			// if( participantTask != NULL &&  participantTask->pid == current->pid && participantNo ){ //  &&  participantTask->pid == current->pid
++
++			// 	unsigned long long  address = addrForSwapIn; 
++				
++			// 	int i, flag = 0 ;
++			// 	for(i = 0; i < totalPageCount; i++){
++			// 		if(swapPageMap[i] == address){
++			// 			swapPageMap[i] = 0; 
++			// 			totalPageUsed--;
++			// 			// printk("one page asked");
++			// 			if(debug) printk("page found");
++			// 			flag = 1; 
++			// 			break;
++			// 		}
++			// 	}
++			// 	if(flag == 0)
++			// 		return ret;
++				
++			// 	unsigned long addr = address;
++			// 	// struct vm_area_struct *vma = find_vma(current->mm, addr);
++
++			// 	if(vma == NULL || addr >= vma->vm_end){ // invalid address
++			// 		if(debug) printk("vma not found");
++			// 	}
++
++			// 	if(debug) printk("opening swapfile");
++			// 	struct file *swapFile = NULL;
++			// 	swapFile = filp_open(fullPath, O_RDONLY , 0 );
++
++			// 	void *buffer =   kmalloc (4096 , GFP_KERNEL); // (char *) ghapla; 
++			// 	loff_t offset = 4096 * i; 
++			// 	int res = kernel_read(swapFile, buffer, 4096, &offset);
++
++			// 	// memset(buffer, 0, 4096); 
++			// 	copy_to_user(address, buffer, 4096); 
++			// 	kfree(buffer);
++
++			// 	// int res = kernel_write(swapFile, buffer, 4096, &offset);
++
++
++			// 	filp_close(swapFile, current->files);
++				
++			// }
++
++
++					return xyz; 
++		}
+ 		else
+ 			return do_fault(vmf);
+ 	}
+@@ -4433,9 +4523,12 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+  * The mmap_lock may have been released depending on flags and our
+  * return value.  See filemap_fault() and __lock_page_or_retry().
+  */
++
++
+ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+ 		unsigned long address, unsigned int flags)
+ {
++
+ 	struct vm_fault vmf = {
+ 		.vma = vma,
+ 		.address = address & PAGE_MASK,
+@@ -4519,6 +4612,8 @@ static vm_fault_t __handle_mm_fault(struct vm_area_struct *vma,
+ 		}
+ 	}
+ 
++	
++
+ 	return handle_pte_fault(&vmf);
+ }
+ 
+@@ -4592,6 +4687,8 @@ static inline void mm_account_fault(struct pt_regs *regs,
+ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+ 			   unsigned int flags, struct pt_regs *regs)
+ {
++
++	// if(participantNo && debug) printk("inside handle_mm_fault "); // shrabana
+ 	vm_fault_t ret;
+ 
+ 	__set_current_state(TASK_RUNNING);
+@@ -4633,6 +4730,76 @@ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+ 
+ 	mm_account_fault(regs, address, flags, ret);
+ 
++		
++	// shrabana
++	if( participantTask != NULL &&  participantTask->pid == current->pid && participantNo ){ //  &&  participantTask->pid == current->pid
++
++		addrForSwapIn = address; 
++		
++		int i, flag = 0 ;
++		for(i = 0; i < totalPageCount; i++){
++			if(swapPageMap[i] == address){
++				swapPageMap[i] = 0; 
++				totalPageUsed--;
++				// printk("one page asked");
++				if(debug) printk("page found");
++				flag = 1; 
++				break;
++			}
++		}
++		if(flag == 0)
++			return ret;
++		
++		unsigned long addr = address;
++		// struct vm_area_struct *vma = find_vma(current->mm, addr);
++
++		if(vma == NULL || addr >= vma->vm_end){ // invalid address
++			if(debug) printk("vma not found");
++		}
++
++		// PRINTK("walking page table\n");
++
++		// pgd_t *pgd = pgd_offset(current->mm,addr);
++		// if(pgd_bad(*pgd) || pgd_none(*pgd)) { // invalid pgd
++		// 	if(debug)  printk("pgd not found");
++		// }
++		// p4d_t *p4d = p4d_offset(pgd,addr);
++		// if(p4d_bad(*p4d) || p4d_none(*p4d)) { // invalid p4d
++		// 	if(debug) printk("p4d not found");
++		// }
++		// pud_t *pud = pud_offset(p4d,addr);
++		// if(pud_bad(*pud) || pud_none(*pud)) { // invalid pud
++		// 	if(debug) printk("pud not found");
++		// }
++		// pmd_t *pmd = pmd_offset(pud,addr);
++		// if(pmd_bad(*pmd) || pmd_none(*pmd)) { // invalid pmd
++		// 	if(debug) printk("pmd not found");
++		// }
++		
++		// pte_t *pte = pte_offset_map(pmd,addr);
++		// if(debug) printk("address found, flag: 1 , pgd: %lx, p4d: %lx, pud: %lx, pmd: %lx, pte: %lx, address: %lx", *pgd, *p4d, *pud, *pmd, *pte, address);
++
++
++		if(debug) printk("opening swapfile");
++		struct file *swapFile = NULL;
++		swapFile = filp_open(fullPath, O_RDONLY , 0 );
++
++		void *buffer =   kmalloc (4096 , GFP_KERNEL); // (char *) ghapla; 
++		loff_t offset = 4096 * i; 
++		int res = kernel_read(swapFile, buffer, 4096, &offset);
++
++		// memset(buffer, 0, 4096); 
++		copy_to_user(address, buffer, 4096); 
++		kfree(buffer);
++
++		// int res = kernel_write(swapFile, buffer, 4096, &offset);
++
++
++		filp_close(swapFile, current->files);
++
++		
++	}
++
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(handle_mm_fault);
+diff --git a/mm/mmap.c b/mm/mmap.c
+index dc7206032..9183dff32 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -2803,6 +2803,9 @@ int split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
+  * work.  This now handles partial unmappings.
+  * Jeremy Fitzhardinge <jeremy@goop.org>
+  */
++
++// shrabana
++extern int participantNo; 
+ int __do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
+ 		struct list_head *uf, bool downgrade)
+ {
+@@ -2822,6 +2825,7 @@ int __do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
+ 	 * and finish any rbtree manipulation before this code
+ 	 * runs and also starts to manipulate the rbtree.
+ 	 */
++
+ 	arch_unmap(mm, start, end);
+ 
+ 	/* Find the first overlapping VMA */
+@@ -2909,7 +2913,7 @@ int __do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
+ 
+ 	/* Fix up all other VM information */
+ 	remove_vma_list(mm, vma);
+-
++	
+ 	return downgrade ? 1 : 0;
+ }
+ 
+@@ -2950,13 +2954,18 @@ int vm_munmap(unsigned long start, size_t len)
+ }
+ EXPORT_SYMBOL(vm_munmap);
+ 
+-SYSCALL_DEFINE2(munmap, unsigned long, addr, size_t, len)
+-{
++// shrabana 
++unsigned long munmapHelper(unsigned long addr, size_t len){
+ 	addr = untagged_addr(addr);
+ 	profile_munmap(addr);
+ 	return __vm_munmap(addr, len, true);
+ }
+ 
++SYSCALL_DEFINE2(munmap, unsigned long, addr, size_t, len)
++{
++	return munmapHelper(addr, len); 
++}
++
+ 
+ /*
+  * Emulation of deprecated remap_file_pages() syscall.
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 519a60d5b..b82628f15 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -73,6 +73,8 @@
+ #include <linux/khugepaged.h>
+ #include <linux/buffer_head.h>
+ 
++
++
+ #include <asm/sections.h>
+ #include <asm/tlbflush.h>
+ #include <asm/div64.h>
+@@ -4959,6 +4961,72 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
+ 	return true;
+ }
+ 
++
++//    shrabana  
++#include <uapi/asm-generic/siginfo.h>    //siginfo
++#include <linux/pid.h>    //find_task_by_pid_type
++#include <linux/sched.h> //  for task_struct
++#include <linux/sched/signal.h> // for kernel_siginfo
++
++
++
++
++// SIGBALLOON subsystem 
++#define SIGBALLOON 		 50
++#define LOW_MEMORY_LIMIT (1UL * 1024 * 1024)
++#define ONE_MB (1UL * 1024)
++extern int participantNo, firstTimeAllocate;
++extern struct task_struct *participantTask;
++extern int sendSignalOnce; 
++
++// allowing 3 signals 
++int counter = 2000; 
++
++
++void lowMemoryChecker(void){
++
++	//	why is this swapping one page in, solved by updating idlebitmap prior but whyy
++	if(participantTask != NULL && participantTask->pid == current->pid && participantNo   ){	// && participantTask != NULL && participantTask->pid == current->pid
++		unsigned long freeMemory = nr_free_pages() << (PAGE_SHIFT - 10);
++		// printk("free memory: %lu \t\t threshold memory : %lu \n", freeMemory, LOW_MEMORY_LIMIT);
++		
++		if( freeMemory <= LOW_MEMORY_LIMIT ){
++			// printk("entered in low memory section \n"); 
++
++			// if(	freeMemory > (ONE_MB * 120) && freeMemory > ( ONE_MB * 100 ) 	)
++			// 	counter = 3; 
++
++			if(sendSignalOnce == 1 || counter <= 0  ) // 
++				return;
++
++			// printk(" \n\n counter: %d \n\n", counter); 
++
++			struct kernel_siginfo ballooningSignalInfo;
++			memset(&ballooningSignalInfo, 0, sizeof(struct kernel_siginfo));
++			ballooningSignalInfo.si_signo = SIGBALLOON;
++ 
++				
++			if (send_sig_info(SIGBALLOON, &ballooningSignalInfo, participantTask) >= 0) {
++				// printk("Signal sent\n"); 				
++				sendSignalOnce = 1; 		
++				counter--;
++			}
++			else{
++				// printk("\n send_sig_info returned -1\n");
++			}
++		}
++		
++		else {
++			sendSignalOnce = 0; 
++			// printk("outside of low memory\n");
++		}
++	}
++
++
++}
++///////////////////////////////////////////////////
++
++
+ /*
+  * This is the 'heart' of the zoned buddy allocator.
+  */
+@@ -4970,7 +5038,7 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
+ 	unsigned int alloc_flags = ALLOC_WMARK_LOW;
+ 	gfp_t alloc_mask; /* The gfp_t that was actually used for allocation */
+ 	struct alloc_context ac = { };
+-
++	
+ 	/*
+ 	 * There are several places where we assume that the order value is sane
+ 	 * so bail out early if the request is out of bound.
+@@ -5021,9 +5089,14 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
+ 	}
+ 
+ 	trace_mm_page_alloc(page, order, alloc_mask, ac.migratetype);
++	
++	 lowMemoryChecker();  // shrabana
++
+ 
+ 	return page;
+ }
++
++
+ EXPORT_SYMBOL(__alloc_pages_nodemask);
+ 
+ /*
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 08c56aaf7..967cad214 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1628,13 +1628,19 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 			 * See handle_pte_fault() ...
+ 			 */
+ 			if (unlikely(PageSwapBacked(page) != PageSwapCache(page))) {
++				// shrabana
++				printk("before rmap warn -------------------------------");
+ 				WARN_ON_ONCE(1);
+ 				ret = false;
++
++				
++				
+ 				/* We have to invalidate as we cleared the pte */
+ 				mmu_notifier_invalidate_range(mm, address,
+ 							address + PAGE_SIZE);
+ 				page_vma_mapped_walk_done(&pvmw);
+ 				break;
++				printk("after rmap warn-------------------------------");
+ 			}
+ 
+ 			/* MADV_FREE page check */
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index ad9f2adaf..8ead361b1 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1067,12 +1067,17 @@ static void page_check_dirty_writeback(struct page *page,
+ /*
+  * shrink_page_list() returns the number of reclaimed pages
+  */
++
++//shrabana
++extern int participantNo; 
++
+ static unsigned int shrink_page_list(struct list_head *page_list,
+ 				     struct pglist_data *pgdat,
+ 				     struct scan_control *sc,
+ 				     struct reclaim_stat *stat,
+ 				     bool ignore_references)
+ {
++
+ 	LIST_HEAD(ret_pages);
+ 	LIST_HEAD(free_pages);
+ 	unsigned int nr_reclaimed = 0;
+@@ -1081,6 +1086,7 @@ static unsigned int shrink_page_list(struct list_head *page_list,
+ 	memset(stat, 0, sizeof(*stat));
+ 	cond_resched();
+ 
++
+ 	while (!list_empty(page_list)) {
+ 		struct address_space *mapping;
+ 		struct page *page;
+@@ -1088,14 +1094,25 @@ static unsigned int shrink_page_list(struct list_head *page_list,
+ 		bool dirty, writeback, may_enter_fs;
+ 		unsigned int nr_pages;
+ 
++		// shrabana
++		// printk("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaaa");
+ 		cond_resched();
+ 
+ 		page = lru_to_page(page_list);
+ 		list_del(&page->lru);
+ 
++		// printk("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
++		// shrabana 
++		// if(participantNo){
++		// 	if(PageAnon(page)){
++		// 		goto keep; 
++		// 	}
++		// }
++
+ 		if (!trylock_page(page))
+ 			goto keep;
+ 
++		// printk("ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+ 		VM_BUG_ON_PAGE(PageActive(page), page);
+ 
+ 		nr_pages = compound_nr(page);
+@@ -1179,6 +1196,8 @@ static unsigned int shrink_page_list(struct list_head *page_list,
+ 		 * memory pressure on the cache working set any longer than it
+ 		 * takes to write them to disk.
+ 		 */
++	
++
+ 		if (PageWriteback(page)) {
+ 			/* Case 1 above */
+ 			if (current_is_kswapd() &&
+@@ -1235,7 +1254,18 @@ static unsigned int shrink_page_list(struct list_head *page_list,
+ 		 * Lazyfree page could be freed directly
+ 		 */
+ 		if (PageAnon(page) && PageSwapBacked(page)) {
++		// shrabana
++		// printk("11111111111111111111111111111\n");
+ 			if (!PageSwapCache(page)) {
++		// printk("2222222222222222222222222222222222222222222222222222\n");
++
++				// //shrabana 
++				// if(participantNo){
++				// 	if(PageAnon(page)){
++				// 		goto keep; 
++				// 	}
++				// }
++
+ 				if (!(sc->gfp_mask & __GFP_IO))
+ 					goto keep_locked;
+ 				if (page_maybe_dma_pinned(page))
+@@ -1418,8 +1448,8 @@ static unsigned int shrink_page_list(struct list_head *page_list,
+ 				}
+ 			}
+ 		}
+-
+ 		if (PageAnon(page) && !PageSwapBacked(page)) {
++			printk("22222222222222222222222222222222222"); 
+ 			/* follow __remove_mapping for reference */
+ 			if (!page_ref_freeze(page, 1))
+ 				goto keep_locked;
+@@ -2255,6 +2285,15 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
+ 	unsigned long ap, fp;
+ 	enum lru_list lru;
+ 
++	// shrabana 
++	// If any process is in ballooning subsystem, do not bother scanning anon pages. 
++	// ignore the swappable anon pages
++	if (participantNo) {
++		scan_balance = SCAN_FILE;
++		goto out;
++	}
++
++
+ 	/* If we have no swap space, do not bother scanning anon pages. */
+ 	if (!sc->may_swap || mem_cgroup_get_nr_swap_pages(memcg) <= 0) {
+ 		scan_balance = SCAN_FILE;
+@@ -2263,7 +2302,7 @@ static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
+ 
+ 	/*
+ 	 * Global reclaim will swap to prevent OOM even with no
+-	 * swappiness, but memcg users want to use this knob to
++	 * swappiness, but memcg users want to use this knob to           
+ 	 * disable swapping for individual groups completely when
+ 	 * using the memory controller's swap limit feature would be
+ 	 * too expensive.
+@@ -4035,6 +4074,7 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
+ 
+ 	return nr_reclaimed;
+ }
++
+ #endif /* CONFIG_HIBERNATION */
+ 
+ /*
+-- 
+2.25.1
+

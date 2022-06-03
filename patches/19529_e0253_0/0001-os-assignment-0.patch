@@ -1,0 +1,237 @@
+From 996b2951649b23c3bf0cc3f1f19054dcccc1d778 Mon Sep 17 00:00:00 2001
+From: Shrabana Biswas <shrabanab@iisc.ac.in>
+Date: Tue, 15 Feb 2022 18:08:39 +0530
+Subject: [PATCH] os assignment-0
+
+Signed-off-by: Shrabana Biswas <shrabanab@iisc.ac.in>
+---
+ Makefile                               |  2 +-
+ arch/x86/entry/syscalls/syscall_64.tbl |  1 +
+ ballooning/Makefile                    |  1 +
+ ballooning/ballooning.c                | 36 ++++++++++++++++
+ include/linux/syscalls.h               |  2 +
+ kernel/exit.c                          | 24 +++++++++++
+ mm/page_alloc.c                        | 59 +++++++++++++++++++++++++-
+ 7 files changed, 123 insertions(+), 2 deletions(-)
+ create mode 100644 ballooning/Makefile
+ create mode 100644 ballooning/ballooning.c
+
+diff --git a/Makefile b/Makefile
+index 1673c12fb..308fdded5 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1097,7 +1097,7 @@ export MODORDER := $(extmod-prefix)modules.order
+ export MODULES_NSDEPS := $(extmod-prefix)modules.nsdeps
+ 
+ ifeq ($(KBUILD_EXTMOD),)
+-core-y		+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/ block/
++core-y		+= kernel/ certs/ mm/ fs/ ipc/ security/ crypto/ block/ ballooning/
+ 
+ vmlinux-dirs	:= $(patsubst %/,%,$(filter %/, \
+ 		     $(core-y) $(core-m) $(drivers-y) $(drivers-m) \
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index 78672124d..9610a0add 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -406,5 +406,6 @@
+ 545	x32	execveat		compat_sys_execveat
+ 546	x32	preadv2			compat_sys_preadv64v2
+ 547	x32	pwritev2		compat_sys_pwritev64v2
++548	64	ballooning		sys_ballooning
+ # This is the end of the legacy x32 range.  Numbers 548 and above are
+ # not special and are not to be used for x32-specific syscalls.
+diff --git a/ballooning/Makefile b/ballooning/Makefile
+new file mode 100644
+index 000000000..c09834408
+--- /dev/null
++++ b/ballooning/Makefile
+@@ -0,0 +1 @@
++obj-y := ballooning.o
+diff --git a/ballooning/ballooning.c b/ballooning/ballooning.c
+new file mode 100644
+index 000000000..ef4514aa4
+--- /dev/null
++++ b/ballooning/ballooning.c
+@@ -0,0 +1,36 @@
++#include <linux/kernel.h>
++#include <linux/sched.h> //  for task_struct
++
++// numbering signal
++#define SIGBALLOON 		50
++
++// total number of application entering ballooning sub system
++int participantNo = 0;
++
++// application info entering ballooning sub system
++struct task_struct *participantTask;
++
++extern int vm_swappiness; 
++
++
++
++int firstTimeAllocate = 0; 
++
++asmlinkage long __x64_sys_ballooning(void)
++{
++
++	if(participantNo){
++		printk("Already one process has registered\n");
++		return -1; 
++	}
++
++	participantNo += 1;
++	firstTimeAllocate = 1; 
++	participantTask = current;	
++	vm_swappiness = 0;
++	printk("current application PID: %d\n",participantTask->pid);
++	return 0;
++	
++	
++	
++}
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 7688bc983..0398cbedf 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1364,4 +1364,6 @@ int __sys_getsockopt(int fd, int level, int optname, char __user *optval,
+ 		int __user *optlen);
+ int __sys_setsockopt(int fd, int level, int optname, char __user *optval,
+ 		int optlen);
++		
++asmlinkage long sys_ballooning(void);
+ #endif
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 04029e35e..3ade78ef9 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -724,9 +724,33 @@ static void check_stack_usage(void)
+ static inline void check_stack_usage(void) {}
+ #endif
+ 
++
++// shrabana 
++extern int participantNo; 
++extern struct task_struct *participantTask;
++extern int vm_swappiness; 
++
++void resetKernelState(void){
++
++	if(participantNo && current->pid  == participantTask->pid ) {
++		// reset the ballooning subsystem variables
++		participantNo = 0;
++		participantTask =  NULL;	
++		
++		// reset vm_swappiness
++		vm_swappiness = 60;
++	}	
++}
++/////////////////////////////////////////////////
++
++
+ void __noreturn do_exit(long code)
+ {
+ 	struct task_struct *tsk = current;
++	
++	resetKernelState(); // shrabana  
++
++	
+ 	int group_dead;
+ 
+ 	/*
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 519a60d5b..47a2abe50 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -73,6 +73,8 @@
+ #include <linux/khugepaged.h>
+ #include <linux/buffer_head.h>
+ 
++
++
+ #include <asm/sections.h>
+ #include <asm/tlbflush.h>
+ #include <asm/div64.h>
+@@ -4959,6 +4961,56 @@ static inline bool prepare_alloc_pages(gfp_t gfp_mask, unsigned int order,
+ 	return true;
+ }
+ 
++
++//    shrabana  
++#include <uapi/asm-generic/siginfo.h>    //siginfo
++#include <linux/pid.h>    //find_task_by_pid_type
++#include <linux/sched.h> //  for task_struct
++#include <linux/sched/signal.h> // for kernel_siginfo
++
++
++
++
++// SIGBALLOON subsystem 
++#define SIGBALLOON 		 50
++#define LOW_MEMORY_LIMIT (1UL * 1024 * 1024)
++extern int participantNo, firstTimeAllocate;
++extern struct task_struct *participantTask;
++
++
++void lowMemoryChecker(void){
++
++	
++	if(participantNo){	
++		unsigned long freeMemory = nr_free_pages() << (PAGE_SHIFT - 10);
++		printk("free memory: %lu \t\t threshold memory : %lu \n", freeMemory, LOW_MEMORY_LIMIT);
++		
++		
++		if( freeMemory <= LOW_MEMORY_LIMIT ){
++			printk("entered in low memory section \n"); 
++
++			struct kernel_siginfo ballooningSignalInfo;
++			memset(&ballooningSignalInfo, 0, sizeof(struct kernel_siginfo));
++			ballooningSignalInfo.si_signo = SIGBALLOON;
++ 
++				
++			if (send_sig_info(SIGBALLOON, &ballooningSignalInfo, participantTask) >= 0) {
++				printk("Signal sent\n"); 						
++			}
++			else{
++				printk("\n send_sig_info returned -1\n");
++			}
++		}
++		else {
++			printk("outside of low memory\n");
++		}
++	}
++
++
++}
++///////////////////////////////////////////////////
++
++
+ /*
+  * This is the 'heart' of the zoned buddy allocator.
+  */
+@@ -4970,7 +5022,7 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
+ 	unsigned int alloc_flags = ALLOC_WMARK_LOW;
+ 	gfp_t alloc_mask; /* The gfp_t that was actually used for allocation */
+ 	struct alloc_context ac = { };
+-
++	
+ 	/*
+ 	 * There are several places where we assume that the order value is sane
+ 	 * so bail out early if the request is out of bound.
+@@ -5021,9 +5073,14 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order, int preferred_nid,
+ 	}
+ 
+ 	trace_mm_page_alloc(page, order, alloc_mask, ac.migratetype);
++	
++	 lowMemoryChecker();  // shrabana
++
+ 
+ 	return page;
+ }
++
++
+ EXPORT_SYMBOL(__alloc_pages_nodemask);
+ 
+ /*
+-- 
+2.25.1
+
